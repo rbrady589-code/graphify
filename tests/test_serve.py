@@ -392,6 +392,28 @@ def test_subgraph_to_text_includes_edge_context():
     assert "context=call" in text
 
 
+def test_subgraph_to_text_ranks_relevant_concept_over_degree_hub():
+    # A query-relevant concept node with low degree must render above an
+    # off-topic but high-degree code hub when a score_map is supplied.
+    G = nx.Graph()
+    G.add_node("concept1", label="Geo Tier System", file_type="concept",
+               source_file="geo.md", source_location="L1", community=0)
+    G.add_node("hub", label="OutreachAgent", file_type="code",
+               source_file="outreach.py", source_location="L1", community=0)
+    for i in range(6):  # give the hub a high degree
+        h = f"h{i}"
+        G.add_node(h, label=f"n{i}", file_type="code", source_file="x.py",
+                   source_location="L1", community=0)
+        G.add_edge("hub", h)
+    nodes = {"concept1", "hub"}
+    text = _subgraph_to_text(G, nodes, [], score_map={"concept1": 1.0})
+    node_lines = [l for l in text.splitlines() if l.startswith("NODE ")]
+    assert node_lines[0].startswith("NODE Geo Tier System"), node_lines
+    # Backward-compat: without score_map, ordering stays pure-degree (hub first).
+    legacy = [l for l in _subgraph_to_text(G, nodes, []).splitlines() if l.startswith("NODE ")]
+    assert legacy[0].startswith("NODE OutreachAgent"), legacy
+
+
 # --- work-memory overlay annotation on NODE lines -----------------------------
 
 def test_subgraph_to_text_annotates_node_with_learning_status():

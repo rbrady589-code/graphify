@@ -150,6 +150,12 @@ _EXACT_MATCH_BONUS = 1000.0
 _PREFIX_MATCH_BONUS = 100.0
 _SUBSTRING_MATCH_BONUS = 1.0
 _SOURCE_MATCH_BONUS = 0.5
+# Output-ranking weight (NOT seed scoring): when rendering the traversal
+# neighbourhood, multiply a node's query relevance by this so the semantic
+# doc layer (concept/rationale/document) surfaces above equally-relevant but
+# generic code nodes. Only breaks ties among query-relevant nodes; off-topic
+# high-degree hubs (relevance 0) stay demoted regardless of file_type.
+_FILE_TYPE_RANK_BOOST = {"concept": 1.5, "rationale": 1.4, "document": 1.2, "paper": 1.2}
 
 
 def _compute_idf(G: nx.Graph, terms: list[str]) -> dict[str, float]:
@@ -561,11 +567,17 @@ def _dfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], lis
     return visited, edges_seen
 
 
-def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_budget: int = 2000, *, seeds: list[str] | None = None) -> str:
+def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_budget: int = 2000, *, seeds: list[str] | None = None, score_map: "dict[str, float] | None" = None) -> str:
     """Render subgraph as text, cutting at token_budget (approx 3 chars/token).
 
-    seeds: exact-match nodes rendered first before the degree-sorted expansion,
-    so the queried symbol always appears at the top of the output.
+    seeds: exact-match nodes rendered first before the expansion, so the queried
+    symbol always appears at the top of the output.
+    score_map: per-node query-relevance scores (from `_score_nodes`). When given,
+    the non-seed expansion is ranked by relevance × file-type weight, then degree
+    — so query-relevant concept/rationale nodes surface above high-degree code
+    hubs that are merely well-connected but off-topic (#hub-flood). When None the
+    ordering is the legacy pure-degree sort, keeping existing callers/output
+    byte-identical.
     """
     char_budget = token_budget * 3
     lines = []
@@ -573,8 +585,14 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_bu
     # Empty when no sidecar exists, so un-annotated output stays byte-identical.
     overlay = getattr(G, "graph", {}).get("_learning_overlay", {}) or {}
     seed_set = set(seeds or [])
-    ordered = [n for n in (seeds or []) if n in nodes] + \
-              sorted(nodes - seed_set, key=lambda n: G.degree(n), reverse=True)
+    if score_map:
+        def _relevance(n: str) -> float:
+            ft = G.nodes[n].get("file_type")
+            return score_map.get(n, 0.0) * _FILE_TYPE_RANK_BOOST.get(ft, 1.0)
+        rest = sorted(nodes - seed_set, key=lambda n: (_relevance(n), G.degree(n)), reverse=True)
+    else:
+        rest = sorted(nodes - seed_set, key=lambda n: G.degree(n), reverse=True)
+    ordered = [n for n in (seeds or []) if n in nodes] + rest
     for nid in ordered:
         d = G.nodes[nid]
         # Every LLM-derived field passes through sanitize_label before being
@@ -651,7 +669,12 @@ def _query_graph_text(
         header_parts.append(f"Context: {', '.join(resolved_filters)} ({filter_source})")
     header_parts.append(f"{len(nodes)} nodes found")
     header = " | ".join(header_parts) + "\n\n"
-    return header + _subgraph_to_text(traversal_graph, nodes, edges, token_budget)
+    # Reuse the relevance scores already computed for seeding to rank the
+    # rendered neighbourhood, so query-relevant concepts beat off-topic hubs.
+    score_map = {nid: s for s, nid in scored}
+    return header + _subgraph_to_text(
+        traversal_graph, nodes, edges, token_budget, seeds=start_nodes, score_map=score_map
+    )
 
 
 def _find_node(G: nx.Graph, label: str) -> list[str]:
